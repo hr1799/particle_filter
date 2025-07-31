@@ -1,7 +1,7 @@
-import rospy
+import rclpy
+from rclpy.node import Node
 import numpy as np
-import tf2_ros
-import tf.transformations as tft
+import tf_transformations as tft
 import utils.utils as Utils
 import range_libc
 from threading import Lock
@@ -23,9 +23,6 @@ from collections import deque
 import cProfile
 import pstats
 
-# Dynamic Reconfigure
-from dynamic_reconfigure.msg import Config
-
 
 class RangeLibVariant(Enum):
     '''
@@ -38,7 +35,7 @@ class RangeLibVariant(Enum):
     VAR_RADIAL_CDDT_OPTIMIZATIONS = 4
 
 
-class ParticleFilter():
+class ParticleFilter(Node):
     '''
     Particle Filter Two: Electric Boogaloo.
 
@@ -47,110 +44,171 @@ class ParticleFilter():
     '''
 
     def __init__(self):
+        super().__init__('particle_filter')
+        
         # parameters
-        self.MAX_PARTICLES = int(rospy.get_param("~max_particles"))
-        self.MAX_VIZ_PARTICLES = int(rospy.get_param("~max_viz_particles"))
-        self.INV_SQUASH_FACTOR = 1.0 / float(rospy.get_param("~squash_factor"))
-        self.MAX_RANGE_METERS = float(rospy.get_param("~max_range"))
-        self.WHICH_RM = rospy.get_param("~range_method", "cddt").lower()
-        self.RANGELIB_VAR = RangeLibVariant(
-            rospy.get_param("~rangelib_variant", "3"))
-        self.POSE_PUB_TOPIC = str(rospy.get_param(
-            "~pose_pub_topic", "/tracked_pose"))
-        self.DO_VIZ = bool(rospy.get_param("~viz"))
-        self.PUBLISH_TF = bool(rospy.get_param("~publish_tf", True))
-        self.ODOM_TOPIC = rospy.get_param("~odometry_topic")
-        self.THETA_DISCRETIZATION = int(
-            rospy.get_param("~theta_discretization", 112))
-        '''Number of discrete bins for angular values for the (P)CDDT and LUT methods'''
-        self.PUB_COVARIANCE = bool(
-            rospy.get_param("~pub_covariance", False))
-        '''Whether or not to publish an empirically-calculated covariance'''
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('debug', False),
+                ('viz', True),
+                ('max_viz_particles', 50),
+                ('max_particles', 3000),
+                ('des_lidar_beams', 21),
+                ('squash_factor', 2.2),
+                ('max_range', 10.0),
+                ('theta_discretization', 150),
+
+                ('range_method', 'glt'),
+                ('rangelib_variant', 3),
+
+                ('pose_pub_topic', '/tracked_pose'),
+                ('scan_topic', '/scan'),
+                ('odometry_topic', '/odom'),
+
+                ('initial_var_x', 0.5),
+                ('initial_var_y', 0.5),
+                ('initial_var_theta', 0.4),
+
+                ('initial_pose_x', np.nan),
+                ('initial_pose_y', np.nan),
+                ('initial_pose_theta', np.nan),
+
+                ('z_hit', 0.85),
+                ('z_short', 0.1),
+                ('z_max', 0.025),
+                ('z_rand', 0.025),
+
+                ('sigma_hit', 0.1),
+                ('lambda_short', 0.25),
+                
+                ('motion_model', 'tum'),
+
+                ('alpha_1_tum', 0.5),
+                ('alpha_2_tum', 0.015),
+                ('alpha_3_tum', 1.0),
+                ('alpha_4_tum', 0.1),
+                ('lam_thresh', 0.1),
+
+                ('alpha_1_amcl', 0.5),
+                ('alpha_2_amcl', 0.5),
+                ('alpha_3_amcl', 1.0),
+                ('alpha_4_amcl', 0.1),
+
+                ('motion_dispersion_arc_x', 0.8),
+                ('motion_dispersion_arc_y', 1.0),
+                ('motion_dispersion_arc_theta', 0.75),
+                ('motion_dispersion_arc_xy', 1.0),
+                ('motion_dispersion_arc_x_min', 0.01),
+                ('motion_dispersion_arc_y_min', 0.03),
+                ('motion_dispersion_arc_y_max', 1.0),
+                ('motion_dispersion_arc_theta_min', 0.01),
+                ('motion_dispersion_arc_xy_min_x', 0.10),
+
+                ('motion_dispersion_x', 0.5),
+                ('motion_dispersion_y', 0.025),
+                ('motion_dispersion_theta', 0.25),
+
+                ('lidar_aspect_ratio', 3.5),
+
+                ('pub_covariance', False),
+                ('publish_pose', True),
+                ('publish_odom', False),
+            ]
+        )
+        
+        # Get parameters
+        self.MAX_PARTICLES = int(self.get_parameter('max_particles').value)
+        self.MAX_VIZ_PARTICLES = int(self.get_parameter('max_viz_particles').value)
+        self.INV_SQUASH_FACTOR = 1.0 / float(self.get_parameter('squash_factor').value)
+        self.MAX_RANGE_METERS = float(self.get_parameter('max_range').value)
+        self.WHICH_RM = str(self.get_parameter('range_method').value).lower()
+        self.RANGELIB_VAR = RangeLibVariant(int(self.get_parameter('rangelib_variant').value))
+        self.POSE_PUB_TOPIC = str(self.get_parameter('pose_pub_topic').value)
+        self.DO_VIZ = bool(self.get_parameter('viz').value)
+        self.ODOM_TOPIC = str(self.get_parameter('odometry_topic').value)
+        self.THETA_DISCRETIZATION = float(self.get_parameter('theta_discretization').value)
+        self.PUB_COVARIANCE = bool(self.get_parameter('pub_covariance').value)
 
         # (Re) initialization constants
-        self.INIT_VAR_X = float(rospy.get_param("~initial_var_x", 0.5))
-        self.INIT_VAR_Y = float(rospy.get_param("~initial_var_y", 0.5))
-        self.INIT_VAR_TH = float(rospy.get_param("~initial_var_theta", 0.4))
+        self.INIT_VAR_X = float(self.get_parameter('initial_var_x').value)
+        self.INIT_VAR_Y = float(self.get_parameter('initial_var_y').value)
+        self.INIT_VAR_TH = float(self.get_parameter('initial_var_theta').value)
 
         # sensor model constants
-        self.Z_HIT = float(rospy.get_param("~z_hit", 0.75))
-        self.Z_SHORT = float(rospy.get_param("~z_short", 0.01))
-        self.Z_MAX = float(rospy.get_param("~z_max", 0.07))
-        self.Z_RAND = float(rospy.get_param("~z_rand", 0.12))
-        self.SIGMA_HIT = float(rospy.get_param("~sigma_hit", 0.4))
-        self.LAM_SHORT = float(rospy.get_param("~lambda_short", 0.1))
+        self.Z_HIT = float(self.get_parameter('z_hit').value)
+        self.Z_SHORT = float(self.get_parameter('z_short').value)
+        self.Z_MAX = float(self.get_parameter('z_max').value)
+        self.Z_RAND = float(self.get_parameter('z_rand').value)
+        self.SIGMA_HIT = float(self.get_parameter('sigma_hit').value)
+        self.LAM_SHORT = float(self.get_parameter('lambda_short').value)
 
         # motion model constants
-        self.MOTION_MODEL = rospy.get_param("~motion_model", "tum").lower()
+        self.MOTION_MODEL = self.get_parameter('motion_model').value.lower()
         if self.MOTION_MODEL == 'tum':
-            self.ALPHA_1 = float(rospy.get_param("~alpha_1_tum"))
-            self.ALPHA_2 = float(rospy.get_param("~alpha_2_tum"))
-            self.ALPHA_3 = float(rospy.get_param("~alpha_3_tum"))
-            self.ALPHA_4 = float(rospy.get_param("~alpha_4_tum"))
+            self.ALPHA_1 = float(self.get_parameter("alpha_1_tum").value)
+            self.ALPHA_2 = float(self.get_parameter("alpha_2_tum").value)
+            self.ALPHA_3 = float(self.get_parameter("alpha_3_tum").value)
+            self.ALPHA_4 = float(self.get_parameter("alpha_4_tum").value)
 
-            rospy.loginfo("PF2 initial parameters...")
-            rospy.loginfo(f"PF2: alpha1: {self.ALPHA_1}")
-            rospy.loginfo(f"PF2: alpha2: {self.ALPHA_2}")
-            rospy.loginfo(f"PF2: alpha3: {self.ALPHA_3}")
-            rospy.loginfo(f"PF2: alpha4: {self.ALPHA_4}")
+            self.get_logger().info("PF2 initial parameters...")
+            self.get_logger().info(f"PF2: alpha1: {self.ALPHA_1}")
+            self.get_logger().info(f"PF2: alpha2: {self.ALPHA_2}")
+            self.get_logger().info(f"PF2: alpha3: {self.ALPHA_3}")
+            self.get_logger().info(f"PF2: alpha4: {self.ALPHA_4}")
 
-            self.LAM_THRESH = float(rospy.get_param("~lam_thresh"))
-            rospy.loginfo(f"PF2: lam_thresh: {self.LAM_THRESH}")
+            self.LAM_THRESH = float(self.get_parameter("lam_thresh").value)
+            self.get_logger().info(f"PF2: lam_thresh: {self.LAM_THRESH}")
         elif self.MOTION_MODEL == 'amcl':
-            self.ALPHA_1 = float(rospy.get_param("~alpha_1_amcl"))
-            self.ALPHA_2 = float(rospy.get_param("~alpha_2_amcl"))
-            self.ALPHA_3 = float(rospy.get_param("~alpha_3_amcl"))
-            self.ALPHA_4 = float(rospy.get_param("~alpha_4_amcl"))
+            self.ALPHA_1 = float(self.get_parameter("alpha_1_amcl").value)
+            self.ALPHA_2 = float(self.get_parameter("alpha_2_amcl").value)
+            self.ALPHA_3 = float(self.get_parameter("alpha_3_amcl").value)
+            self.ALPHA_4 = float(self.get_parameter("alpha_4_amcl").value)
         elif self.MOTION_MODEL == 'arc':
-            rospy.logwarn("Using arc motion model - may not be fully tested.")
+            self.get_logger().warn("Using arc motion model - may not be fully tested.")
             self.MOTION_DISPERSION_ARC_X = float(
-                rospy.get_param("~motion_dispersion_arc_x", 0.05))
+                self.get_parameter("motion_dispersion_arc_x").value)
             self.MOTION_DISPERSION_ARC_Y = float(
-                rospy.get_param("~motion_dispersion_arc_y", 0.025))
+                self.get_parameter("motion_dispersion_arc_y").value)
             self.MOTION_DISPERSION_ARC_THETA = float(
-                rospy.get_param("~motion_dispersion_arc_theta", 0.25))
+                self.get_parameter("motion_dispersion_arc_theta").value)
             self.MOTION_DISPERSION_ARC_XY = float(
-                rospy.get_param("~motion_dispersion_arc_xy", 0))
+                self.get_parameter("motion_dispersion_arc_xy").value)
             # self.MOTION_DISPERSION_ARC_XY_MAX = float(
-            #     rospy.get_param("~motion_dispersion_arc_xy_max", 0))
+            #     self.get_parameter("motion_dispersion_arc_xy_max").value)
             # self.MOTION_DISPERSION_ARC_XTHETA = float(
-            #     rospy.get_param("~motion_dispersion_arc_xtheta", 0))
+            #     self.get_parameter("motion_dispersion_arc_xtheta").value)
             self.MOTION_DISPERSION_ARC_X_MIN = float(
-                rospy.get_param("~motion_dispersion_arc_x_min", 0.01))
+                self.get_parameter("motion_dispersion_arc_x_min").value)
             self.MOTION_DISPERSION_ARC_Y_MIN = float(
-                rospy.get_param("~motion_dispersion_arc_y_min", 0.01))
+                self.get_parameter("motion_dispersion_arc_y_min").value)
             self.MOTION_DISPERSION_ARC_Y_MAX = float(
-                rospy.get_param("~motion_dispersion_arc_y_max", 0.01))
+                self.get_parameter("motion_dispersion_arc_y_max").value)
             self.MOTION_DISPERSION_ARC_THETA_MIN = float(
-                rospy.get_param("~motion_dispersion_arc_theta_min", 0.01))
+                self.get_parameter("motion_dispersion_arc_theta_min").value)
             self.MOTION_DISPERSION_ARC_XY_MIN_X = float(
-                rospy.get_param("~motion_dispersion_arc_xy_min_x", 0.01))
+                self.get_parameter("motion_dispersion_arc_xy_min_x").value)
         else:
-            rospy.logwarn("Using default MIT PF motion model - may not be fully tested.")
+            self.get_logger().warn("Using default MIT PF motion model - may not be fully tested.")
             self.MOTION_DISPERSION_X = float(
-                rospy.get_param("~motion_dispersion_x", 0.05))
+                self.get_parameter("motion_dispersion_x").value)
             self.MOTION_DISPERSION_Y = float(
-                rospy.get_param("~motion_dispersion_y", 0.025))
+                self.get_parameter("motion_dispersion_y").value)
             self.MOTION_DISPERSION_THETA = float(
-                rospy.get_param("~motion_dispersion_theta", 0.25))
+                self.get_parameter("motion_dispersion_theta").value)
 
         # Boxed lidar model paramters.
         # The defaults are based on the Hokyuo laser scan.
         self.LIDAR_ASPECT_RATIO = float(
-            rospy.get_param("~lidar_aspect_ratio", 3.0))
-        self.DES_LIDAR_BEAMS = int(rospy.get_param("~des_lidar_beams", 21))
+            self.get_parameter("lidar_aspect_ratio").value)
+        self.DES_LIDAR_BEAMS = int(self.get_parameter("des_lidar_beams").value)
         '''Desired number of beams. Will be an odd number'''
-
-        scan_msg : LaserScan = rospy.wait_for_message('/scan', LaserScan, None)
-        self.NUM_LIDAR_BEAMS = len(scan_msg.ranges)
-        self.START_THETA = scan_msg.angle_min
-        self.END_THETA = scan_msg.angle_max
 
         # Data members in the Particle Filter
         self.state_lock = Lock()
         '''Lock to prevent multithreading errors'''
-        self.rate = rospy.Rate(200)
-        '''Enforces update rate. This should not be lower than the odom message rate (50)'''
+        self.update_rate = 200.0  # Hz
+        '''Update rate. This should not be lower than the odom message rate (50)'''
         self.MAX_RANGE_PX: int = None
         '''Maximum lidar range in pixels'''
         self.odometry_data = np.array([0.0, 0.0, 0.0])
@@ -171,9 +229,9 @@ class ParticleFilter():
         '''3-vector holding the current pose from odometry (x,y,theta)'''
         self.range_method = None
         '''RangeLibc binding, set in `get_omap()`'''
-        self.last_stamp: rospy.Time = rospy.Time(0)
+        self.last_stamp = self.get_clock().now().to_msg()
         '''Timestamp of last-recieved odometry message'''
-        self.last_pub_stamp = rospy.Time.now()
+        self.last_pub_stamp = self.get_clock().now().to_msg()
         '''Last published timestamp'''
         self.first_sensor_update = True
         '''Boolean flag for use in `sensor_model()`'''
@@ -208,71 +266,57 @@ class ParticleFilter():
         if self.PUB_COVARIANCE:
             self.cov = np.zeros((3, 3))
             '''NDArray representing the covariance (x,y,theta)'''
+        
+        self.create_subscription(LaserScan, str(self.get_parameter("scan_topic").value),
+                                 self.lidarCB, 2)
 
-        # Initialize Map and Sensor Model
-        self.get_boxed_indices()
-        self.get_omap()
+    def complete_initialization(self):
+        # Initialize Sensor Model
         self.precompute_sensor_model()
 
         # Initialize position (if known). Else use "lost robot" mode
-        if rospy.has_param("~initial_pose_x") and \
-                rospy.has_param("~initial_pose_y") and \
-                rospy.has_param("~initial_pose_theta"):
+        START_X = self.get_parameter("initial_pose_x").value
+        START_Y = self.get_parameter("initial_pose_y").value
+        START_THETA = self.get_parameter("initial_pose_theta").value
 
-            START_X = rospy.get_param("~initial_pose_x")
-            START_Y = rospy.get_param("~initial_pose_y")
-            START_THETA = rospy.get_param("~initial_pose_theta")
+        if START_X != np.nan and \
+                START_Y != np.nan and \
+                START_THETA != np.nan:
             self.initialize_particles_pose(
                 START_X, START_Y, posetheta=START_THETA)
         else:
             self.initialize_global()
 
-        self.particle_pub = rospy.Publisher(
-            "/pf/viz/particles", PoseArray, queue_size=1)
+        self.particle_pub = self.create_publisher(
+            PoseArray, "/pf/viz/particles", 1)
         '''Publishes particle cloud onto `/pf/viz/particles` (randomly sampled)'''
 
-        self.pose_pub = rospy.Publisher(
-            self.POSE_PUB_TOPIC, PoseStamped, queue_size=1)
+        self.pose_pub = self.create_publisher(
+            PoseStamped, self.POSE_PUB_TOPIC, 1)
         '''Publishes inferred pose on POSE_PUB_TOPIC (default: `/tracked_pose`)'''
         if self.PUB_COVARIANCE:
-            self.pose_cov_pub = rospy.Publisher(
-                self.POSE_PUB_TOPIC+'/with_covariance', PoseWithCovarianceStamped, queue_size=1)
+            self.pose_cov_pub = self.create_publisher(
+                PoseWithCovarianceStamped, self.POSE_PUB_TOPIC+'/with_covariance', 1)
             '''Publishes inferred pose with Covariance. (default: `/tracked_pose/with_covariance`)'''
 
-        self.pub_tf = tf2_ros.TransformBroadcaster()
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
-
-        # Wait for transforms
-        while not self.tf_buffer.can_transform("base_link", "laser", rospy.Time(), rospy.Duration(1.0)):
-            rospy.logwarn("PF2 Waiting for base_link->laser transformation")
-        rospy.loginfo("base_link->laser transformation OK")
-
-        trans: TransformStamped = self.tf_buffer.lookup_transform(
-            "base_link", "laser", rospy.Time())
         self.laser_base_link_offset = np.array([
-            trans.transform.translation.x,
-            trans.transform.translation.y,
+            0.273,
+            0.0,
             0.0])
 
         # ! Honestly this can just be a function, doesn't need to be a class
         self.particle_utils = Utils.ParticleUtils(self.laser_base_link_offset)
 
-        rospy.Subscriber(rospy.get_param("~scan_topic", "/scan"),
-                         LaserScan, self.lidarCB, queue_size=2)
         # tcp_nodelay ensures we get a fixed 50hz, bypassing wacky buffering in the Transport Layer
-        rospy.Subscriber(self.ODOM_TOPIC, Odometry, self.odomCB, queue_size=2, tcp_nodelay=True)
-        # rospy.Subscriber(self.ODOM_TOPIC, Odometry, self.odomCB, queue_size=2, tcp_nodelay=False)
-        rospy.Subscriber("/initialpose", PoseWithCovarianceStamped,
-                         self.clicked_poseCB, queue_size=1)
-        rospy.Subscriber("/clicked_point", PointStamped,
-                         self.clicked_poseCB, queue_size=1)
-        rospy.Subscriber(
-            "/dynamic_pf2_tuner_node/parameter_updates", Config, self.dyn_param_cb)
+        self.create_subscription(Odometry, self.ODOM_TOPIC, self.odomCB, 2)
+        self.create_subscription(PoseWithCovarianceStamped, "/initialpose",
+                                 self.clicked_poseCB, 1)
+        self.create_subscription(PointStamped, "/clicked_point",
+                                 self.clicked_poseCB, 1)
 
-        rospy.loginfo("PF2 finished initializing.")
+        self.get_logger().info("PF2 finished initializing.")
 
-        self.DEBUG = bool(rospy.get_param("~debug", False))
+        self.DEBUG = bool(self.get_parameter('debug').value)
         if self.DEBUG:
             self.sensor_model_time_ms = deque(maxlen=150)
             self.motion_model_time_ms = deque(maxlen=150)
@@ -283,18 +327,45 @@ class ParticleFilter():
 
 
         # Debugging stuff
-        self.last_odom = rospy.Time.now().to_sec()
-        self.last_odom_msg : Odometry = None
+        self.last_odom = self.get_clock().now().nanoseconds / 1e9
+        self.last_odom_msg: Odometry = None
         '''The most-recently processed odom msg'''
-        self.last_vesc = rospy.Time.now().to_sec()
+        self.last_vesc = self.get_clock().now().nanoseconds / 1e9
+
+        # Timer for the main loop
+        self.timer = self.create_timer(1.0 / self.update_rate, self.loop)
 
     def get_omap(self):
         '''
         Fetch the occupancy grid map from the map_server instance, and initialize the correct
         RangeLibc method. Also stores a matrix which indicates the permissible region of the map
         '''
-        rospy.wait_for_service("static_map")
-        map_msg = rospy.ServiceProxy("static_map", GetMap)().map
+        self.get_logger().info("PF2: Getting map from map server...")
+        # rospy.wait_for_service("static_map")
+        # map_msg = rospy.ServiceProxy("static_map", GetMap)().map
+
+        map_client = self.create_client(GetMap, "map_server/map")
+
+        while not map_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("Waiting for map server...")
+        
+        self.get_logger().info("Map server found, requesting map...")
+        request = GetMap.Request()
+        future = map_client.call_async(request)
+        future.add_done_callback(self.map_service_callback)
+
+    def map_service_callback(self, future):
+        try:
+            response = future.result()
+        except Exception as e:
+            self.get_logger().error(f"Map service call failed: {str(e)}")
+            return
+        
+        if response is not None:
+            map_msg = response.map
+            self.get_logger().info("Map received")
+        else:
+            self.get_logger().error("Map service succeeded, but no map was returned")
 
         self.map_info = map_msg.info
         oMap = range_libc.PyOMap(map_msg)
@@ -302,7 +373,7 @@ class ParticleFilter():
             self.MAX_RANGE_METERS / self.map_info.resolution)
 
         # initialize range method
-        rospy.loginfo(f"Initializing range method: {self.WHICH_RM}")
+        self.get_logger().info(f"Initializing range method: {self.WHICH_RM}")
         if self.WHICH_RM == "bl":
             self.range_method = range_libc.PyBresenhamsLine(
                 oMap, self.MAX_RANGE_PX)
@@ -310,7 +381,7 @@ class ParticleFilter():
             self.range_method = range_libc.PyCDDTCast(
                 oMap, self.MAX_RANGE_PX, self.THETA_DISCRETIZATION)
             if self.WHICH_RM == "pcddt":
-                rospy.loginfo("Pruning...")
+                self.get_logger().info("Pruning...")
                 self.range_method.prune()
         elif self.WHICH_RM == "rm":
             self.range_method = range_libc.PyRayMarching(
@@ -321,7 +392,7 @@ class ParticleFilter():
         elif self.WHICH_RM == "glt":
             self.range_method = range_libc.PyGiantLUTCast(
                 oMap, self.MAX_RANGE_PX, self.THETA_DISCRETIZATION)
-        rospy.loginfo("Done loading map")
+        self.get_logger().info("Done loading map")
 
         # 0: permissible, -1: unmapped, 100: blocked
         array_255 = np.array(map_msg.data).reshape(
@@ -341,6 +412,7 @@ class ParticleFilter():
         # plt.show()
 
         self.map_initialized = True
+        self.complete_initialization()
 
     def precompute_sensor_model(self):
         '''
@@ -351,7 +423,8 @@ class ParticleFilter():
         This table is indexed by the sensor model at runtime by discretizing the measurements
         and computed ranges from RangeLibc.
         '''
-        rospy.loginfo("Precomputing sensor model")
+        self.get_logger().info("Precomputing sensor model")
+
         # sensor model constants
         z_short = self.Z_SHORT
         z_max = self.Z_MAX
@@ -467,7 +540,7 @@ class ParticleFilter():
         dist = np.sqrt(dx**2 + dy**2)
         total_dist = np.sum(dist)
         dist_amt = total_dist/(self.DES_LIDAR_BEAMS-1)
-        # rospy.loginfo(f"{dist.shape=}, {total_dist=:.2f}, {dist_amt=:.2f}")
+        # self.get_logger().info(f"{dist.shape=}, {total_dist=:.2f}, {dist_amt=:.2f}")
 
         # Calc half of the evenly-spaced interval first, then the other half
         idx = MID_IDX + 1
@@ -500,12 +573,13 @@ class ParticleFilter():
 
         Future Extension: Informed sampling by spreading over the race line
         '''
+        self.get_logger().info("Initializing particles globally")
         while self.state_lock.locked():
-            rospy.loginfo_once("PF2 Global Initialization: Waiting for state to become unlocked")
-            rospy.sleep(0.1)
+            self.get_logger().info_once("PF2 Global Initialization: Waiting for state to become unlocked")
+            rclpy.spin_once(self, timeout_sec=0.1)
 
         self.state_lock.acquire()
-        rospy.loginfo("Lost Robot Initialization")
+        self.get_logger().info("Lost Robot Initialization")
 
         # randomize over grid coordinate space
         permissible_x, permissible_y = np.where(self.permissible_region == 1)
@@ -532,6 +606,7 @@ class ParticleFilter():
 
         Either initialize with a yaw (theta) or Quaternion.
         '''
+        self.get_logger().info("Initializing particles pose")
         assert not (posetheta is None and poseo is None)
         assert not (posetheta is not None and poseo is not None)
 
@@ -540,15 +615,15 @@ class ParticleFilter():
         init_var_th = self.INIT_VAR_TH
 
         while self.state_lock.locked():
-            rospy.loginfo_once("PF2 Pose Initialization: Waiting for state to become unlocked")
-            rospy.sleep(0.1)
+            self.get_logger().info_once("PF2 Pose Initialization: Waiting for state to become unlocked")
+            rclpy.spin_once(self, timeout_sec=0.1)
 
         self.state_lock.acquire()
 
         if poseo is not None:
             posetheta = Utils.quaternion_to_angle(poseo)
 
-        rospy.loginfo(
+        self.get_logger().info(
             f"Setting initial pose at x:{posex:.2f}, y:{posey:.2f}, theta:{np.degrees(posetheta):.2f}deg")
         self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
         self.particles[:, 0] = posex + \
@@ -560,46 +635,35 @@ class ParticleFilter():
 
         self.state_lock.release()
 
-    # Callbacks
-    def dyn_param_cb(self, _):
-        '''Reads relevant dynamically reconfigurable params off the parameter server'''
-        if self.MOTION_MODEL == 'tum' or self.MOTION_MODEL == 'amcl':
-            self.ALPHA_1 = float(rospy.get_param("dynamic_pf2_tuner_node/alpha_1"))
-            self.ALPHA_2 = float(rospy.get_param("dynamic_pf2_tuner_node/alpha_2"))
-            self.ALPHA_3 = float(rospy.get_param("dynamic_pf2_tuner_node/alpha_3"))
-            self.ALPHA_4 = float(rospy.get_param("dynamic_pf2_tuner_node/alpha_4"))
-
-            rospy.loginfo("PF2 dynamic reconfigure...")
-            rospy.loginfo(f"PF2: alpha1: {self.ALPHA_1}")
-            rospy.loginfo(f"PF2: alpha2: {self.ALPHA_2}")
-            rospy.loginfo(f"PF2: alpha3: {self.ALPHA_3}")
-            rospy.loginfo(f"PF2: alpha4: {self.ALPHA_4}")
-
-            if self.MOTION_MODEL == 'tum':
-                self.LAM_THRESH = float(rospy.get_param("dynamic_pf2_tuner_node/lam_thresh"))
-                rospy.loginfo(f"PF2: lam_thresh: {self.LAM_THRESH}")
-
     def lidarCB(self, msg: LaserScan):
+        if not self.lidar_initialized:
+            self.NUM_LIDAR_BEAMS = len(msg.ranges)
+            self.START_THETA = msg.angle_min
+            self.END_THETA = msg.angle_max
+
+            self.get_boxed_indices()
+            self.get_omap()
+            self.lidar_initialized = True
+
         self.downsampled_ranges = np.array(msg.ranges)[self.LIDAR_SAMPLE_IDXS]
-        self.lidar_initialized = True
 
     def odomCB(self, msg: Odometry):
         self.odom_msgs.append(msg)
         self.last_odom_msg = msg
-        # rospy.loginfo(f"Odom gap: {(rospy.Time.now().to_sec()-self.last_odom)*1000}ms")
+        # self.get_logger().info(f"Odom gap: {(rospy.Time.now().to_sec()-self.last_odom)*1000}ms")
         # self.last_odom = rospy.Time.now().to_sec()
 
         # if self.last_odom_msg is not None:
         #     dx = self.last_odom_msg.pose.pose.position.x - msg.pose.pose.position.x
         #     dy = self.last_odom_msg.pose.pose.position.y - msg.pose.pose.position.y
-        #     rospy.loginfo(f"{dx=:.6f}, {dy=:.6f}")
+        #     self.get_logger().info(f"{dx=:.6f}, {dy=:.6f}")
 
     def clicked_poseCB(self, msg):
         '''
         Receive pose messages from RViz and initialize the particle distribution in response.
         '''
         if isinstance(msg, PointStamped):
-            rospy.loginfo(
+            self.get_logger().info(
                 "Recieved PointStamped message, re-initializing globally")
             self.initialize_global()
         elif isinstance(msg, PoseWithCovarianceStamped):
@@ -610,11 +674,11 @@ class ParticleFilter():
 
     # Visualize and Publish
 
-    def publish_tf(self, pose, stamp):
-        """ Publish tf and Pose messages for the car. """
+    def publish_pose(self, pose, stamp):
+        """ Publish Pose messages for the car. """
 
         # Avoid re-publishing stamp
-        if stamp.to_sec() <= self.last_pub_stamp.to_sec():
+        if stamp.sec + stamp.nanosec * 1e-9 <= self.last_pub_stamp.sec + self.last_pub_stamp.nanosec * 1e-9:
             return
 
         map_base_link_pos = pose[0:2]
@@ -645,22 +709,7 @@ class ParticleFilter():
             pose_cov_msg.pose.covariance = covariance.flatten().tolist()
             self.pose_cov_pub.publish(pose_cov_msg)
 
-        # rospy.loginfo(f"Inferred pose at x: {pose[0]:.2f}, y: {pose[1]:.2f}")
-
-        if self.PUBLISH_TF:
-            t = TransformStamped()
-            t.header = header
-            t.child_frame_id = "base_link"
-            t.transform.translation.x = map_base_link_pos[0]
-            t.transform.translation.y = map_base_link_pos[1]
-            t.transform.translation.z = 0.0
-            t.transform.rotation.x = map_laser_rotation[0]
-            t.transform.rotation.y = map_laser_rotation[1]
-            t.transform.rotation.z = map_laser_rotation[2]
-            t.transform.rotation.w = map_laser_rotation[3]
-
-            # Publish position/orientation for car_state
-            self.pub_tf.sendTransform(t)
+        # self.get_logger().info(f"Inferred pose at x: {pose[0]:.2f}, y: {pose[1]:.2f}")
 
         self.last_pub_stamp = self.last_stamp
 
@@ -785,9 +834,9 @@ class ParticleFilter():
             scale_th = max(self.MOTION_DISPERSION_ARC_THETA_MIN, np.abs(dtheta_) * self.MOTION_DISPERSION_ARC_THETA)
 
             # debugging scales
-            # rospy.loginfo(f"{np.abs(dx_)=:.4f} | {scale_x:.4f} | {self.last_odom_msg.twist.twist.linear.x:.4f}")
-            # rospy.loginfo(f"{np.abs(dy_)=:.4f} | {scale_y:.4f}")
-            # rospy.loginfo(f"{np.abs(dtheta_)=:.4f} | {scale_th:.4f}\n")
+            # self.get_logger().info(f"{np.abs(dx_)=:.4f} | {scale_x:.4f} | {self.last_odom_msg.twist.twist.linear.x:.4f}")
+            # self.get_logger().info(f"{np.abs(dy_)=:.4f} | {scale_y:.4f}")
+            # self.get_logger().info(f"{np.abs(dtheta_)=:.4f} | {scale_th:.4f}\n")
 
             dx = np.random.normal(loc=dx_, scale=scale_x, size=self.MAX_PARTICLES)
             dy = np.random.normal(loc=dy_, scale=scale_y, size=self.MAX_PARTICLES)
@@ -862,8 +911,8 @@ class ParticleFilter():
             if self.RANGELIB_VAR == RangeLibVariant.VAR_NO_EVAL_SENSOR_MODEL or \
                self.RANGELIB_VAR == RangeLibVariant.VAR_CALC_RANGE_MANY_EVAL_SENSOR:
 
-                rospy.logwarn("""In these modes, the proposal_dist is not transformed from the base_links to the laser frame.
-                              Performance of PF will be worse. Try using another variant instead, as they offer better speed anyway!""")
+                self.get_logger().warn("""In these modes, the proposal_dist is not transformed from the base_links to the laser frame.
+                                       Performance of PF will be worse. Try using another variant instead, as they offer better speed anyway!""")
 
                 self.queries = np.zeros(
                     (num_rays*self.MAX_PARTICLES, 3), dtype=np.float32)
@@ -1035,7 +1084,7 @@ class ParticleFilter():
             return
 
         if self.state_lock.locked():
-            rospy.loginfo("Concurrency error avoided")
+            self.get_logger().info("Concurrency error avoided")
             return
 
         self.state_lock.acquire()
@@ -1059,88 +1108,88 @@ class ParticleFilter():
         self.state_lock.release()
 
         # publish transformation frame based on inferred pose
-        self.publish_tf(self.inferred_pose, self.last_stamp)
+        self.publish_pose(self.inferred_pose, self.last_stamp)
 
         self.visualise()
 
     # Main loop
     def loop(self):
-        while not rospy.is_shutdown():
-            if self.DEBUG:
-                self.profiler.enable()
-                tic = time()
+        if self.DEBUG:
+            self.profiler.enable()
+            tic = time()
 
-            # Assert odom has been initialised / there are things to process
-            if len(self.odom_msgs) == 0:
-                continue
+        # Assert odom has been initialised / there are things to process
+        if len(self.odom_msgs) == 0:
+            return
 
-            # Get the furthest-back message in the buffer
-            msg: Odometry = self.odom_msgs[0]
+        # Get the furthest-back message in the buffer
+        msg: Odometry = self.odom_msgs[0]
 
-            # Quantify gap in message pubs (this was solved with the tcp_nodelay setting)
-            # msg_time = msg.header.stamp.to_sec()
-            # now_time = rospy.Time.now().to_sec()
-            # rospy.loginfo(f"Time gap to present: {(now_time-msg_time)*1000:.2f}ms | Buffer Size: {len(self.odom_msgs)}")
+        # Quantify gap in message pubs (this was solved with the tcp_nodelay setting)
+        # msg_time = msg.header.stamp.to_sec()
+        # now_time = rospy.Time.now().to_sec()
+        # self.get_logger().info(f"Time gap to present: {(now_time-msg_time)*1000:.2f}ms | Buffer Size: {len(self.odom_msgs)}")
 
-            position = np.array([
-                msg.pose.pose.position.x,
-                msg.pose.pose.position.y])
+        position = np.array([
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y])
 
-            orientation = Utils.quaternion_to_angle(msg.pose.pose.orientation)
-            self.curr_pose = np.array([position[0], position[1], orientation])
+        orientation = Utils.quaternion_to_angle(msg.pose.pose.orientation)
+        self.curr_pose = np.array([position[0], position[1], orientation])
 
-            self.update()   # Update based on curr_pose and last_pose
+        self.update()   # Update based on curr_pose and last_pose
 
-            if isinstance(self.last_pose, np.ndarray):
-                # changes in x,y,theta in local coordinate system of the car
-                rot = Utils.rotation_matrix(-self.last_pose[2])
-                delta = np.array(
-                    [position - self.last_pose[0:2]]).transpose()
-                local_delta = (rot*delta).transpose()
-                self.odometry_data = np.array(
-                    [local_delta[0, 0], local_delta[0, 1], orientation - self.last_pose[2]])
+        if isinstance(self.last_pose, np.ndarray):
+            # changes in x,y,theta in local coordinate system of the car
+            rot = Utils.rotation_matrix(-self.last_pose[2])
+            delta = np.array(
+                [position - self.last_pose[0:2]]).transpose()
+            local_delta = (rot*delta).transpose()
+            self.odometry_data = np.array(
+                [local_delta[0, 0], local_delta[0, 1], orientation - self.last_pose[2]])
 
-                self.odom_initialized = True
-            else:
-                rospy.loginfo("PF2...Received first Odometry message")
+            self.odom_initialized = True
+        else:
+            self.get_logger().info("PF2...Received first Odometry message")
 
-            # self.last_stamp = msg.header.stamp
-            self.last_stamp = rospy.Time.now()
-            self.last_pose = self.curr_pose
-            self.odom_msgs.popleft()
+        # self.last_stamp = msg.header.stamp
+        self.last_stamp = self.get_clock().now().to_msg()
+        self.last_pose = self.curr_pose
+        self.odom_msgs.popleft()
 
-            self.rate.sleep()
+        if self.DEBUG:
+            self.profiler.disable()
+            self.overall_time_ms.append((time()-tic)*1000)
 
-            if self.DEBUG:
-                self.profiler.disable()
-                self.overall_time_ms.append((time()-tic)*1000)
+            if (self.itr % 30) == 0:
+                s_mean = np.mean(self.sensor_model_time_ms)
+                s_std = np.std(self.sensor_model_time_ms)
+                m_mean = np.mean(self.motion_model_time_ms)
+                m_std = np.std(self.motion_model_time_ms)
+                o_mean = np.mean(self.overall_time_ms)
+                o_std = np.std(self.overall_time_ms)
 
-                if (self.itr % 30) == 0:
-                    s_mean = np.mean(self.sensor_model_time_ms)
-                    s_std = np.std(self.sensor_model_time_ms)
-                    m_mean = np.mean(self.motion_model_time_ms)
-                    m_std = np.std(self.motion_model_time_ms)
-                    o_mean = np.mean(self.overall_time_ms)
-                    o_std = np.std(self.overall_time_ms)
+                self.get_logger().info(
+                    f"Sensor Model: {s_mean:4.2f}ms std:{s_std:4.2f}ms | Motion Model: {m_mean:4.2f}ms std:{m_std:4.2f}ms | Overall: {o_mean:4.2f}ms std:{o_std:4.2f}ms")
 
-                    rospy.loginfo(
-                        f"Sensor Model: {s_mean:4.2f}ms std:{s_std:4.2f}ms | Motion Model: {m_mean:4.2f}ms std:{m_std:4.2f}ms | Overall: {o_mean:4.2f}ms std:{o_std:4.2f}ms")
+            if (self.itr % 500) == 0:
+                stats = pstats.Stats(self.profiler)
+                stats.sort_stats(pstats.SortKey.TIME)
+                # look for this in ~/.ros
+                stats.dump_stats(filename="pf2_stats.prof")
+                self.get_logger().warn("PF2 Dumping profiling stats to file.")
 
-                if (self.itr % 500) == 0:
-                    stats = pstats.Stats(self.profiler)
-                    stats.sort_stats(pstats.SortKey.TIME)
-                    # look for this in ~/.ros
-                    stats.dump_stats(filename="pf2_stats.prof")
-                    rospy.logwarn("PF2 Dumping profiling stats to file.")
+            self.itr += 1
 
-                self.itr += 1
 
+def main(args=None):
+    rclpy.init(args=args)
+    pf = ParticleFilter()
+    rclpy.spin(pf)
+    rclpy.shutdown()
 
 if __name__ == "__main__":
-    rospy.init_node("particle_filter")
-    pf = ParticleFilter()
-    pf.loop()
-    rospy.spin()
+    main()
 
 # // Put this into __init__()
 # // To decouple publishing a pose from computation of inferred pose...
@@ -1178,8 +1227,8 @@ if __name__ == "__main__":
 
 #             delta_t = now_time - msg.header.stamp.to_sec()
 #             # delta_t = now_time - self.last_stamp.to_sec()
-#             # rospy.loginfo(f"{( msg.header.stamp.to_sec()-self.last_stamp.to_sec() )*1000}ms")
-#             # rospy.loginfo(f"Now: {str(now_time)[4:]} Diff in time from last odom to now: {delta_t*1000:.3f}ms. Curr Exp: {timer.current_expected.to_sec()} Curr Real: {timer.current_real.to_sec()}")
+#             # self.get_logger().info(f"{( msg.header.stamp.to_sec()-self.last_stamp.to_sec() )*1000}ms")
+#             # self.get_logger().info(f"Now: {str(now_time)[4:]} Diff in time from last odom to now: {delta_t*1000:.3f}ms. Curr Exp: {timer.current_expected.to_sec()} Curr Real: {timer.current_real.to_sec()}")
 #             delta_x_B = msg.twist.twist.linear.x * delta_t
 #             delta_y_B = msg.twist.twist.linear.y * delta_t
 #             delta_th_B = msg.twist.twist.angular.z * delta_t
@@ -1200,7 +1249,7 @@ if __name__ == "__main__":
 #         tic = time()
 #         if len(self.t_history_inferred) > 3 and not self.state_lock.locked():
 #             delta_t = now_time - self.t_history_inferred[-1]
-#             # rospy.loginfo(f"Now: {str(now_time)[4:]} Diff in time from last odom to now: {delta_t*1000:.3f}ms.")
+#             # self.get_logger().info(f"Now: {str(now_time)[4:]} Diff in time from last odom to now: {delta_t*1000:.3f}ms.")
 
 #             assert len(self.t_history_inferred)==len(self.x_history_inferred)
 #             tck_x = splrep(self.t_history_inferred, self.x_history_inferred, s=len(self.t_history_inferred)-1)
@@ -1214,9 +1263,9 @@ if __name__ == "__main__":
 #             s_int = BSpline(*tck_s)(self.t_history_inferred[-1])
 #             c_int = BSpline(*tck_c)(self.t_history_inferred[-1])
 
-#             rospy.loginfo(f"{x_int=:.2f}, {self.x_history_inferred[-1]=:.2f}, diff:{x_int-self.x_history_inferred[-1]:.2f}")
-#             rospy.loginfo(f"{y_int=:.2f}, {self.y_history_inferred[-1]=:.2f}, diff:{y_int-self.y_history_inferred[-1]:.2f}")
-#             rospy.loginfo(f"Comp_time = {(time()-tic)*1000}ms \n")
+#             self.get_logger().info(f"{x_int=:.2f}, {self.x_history_inferred[-1]=:.2f}, diff:{x_int-self.x_history_inferred[-1]:.2f}")
+#             self.get_logger().info(f"{y_int=:.2f}, {self.y_history_inferred[-1]=:.2f}, diff:{y_int-self.y_history_inferred[-1]:.2f}")
+#             self.get_logger().info(f"Comp_time = {(time()-tic)*1000}ms \n")
 
 #             deadreckon_pose = [ x_int, y_int, np.arctan2(s_int, c_int) ]
 #             self.publish_tf(deadreckon_pose, rospy.Time.now())

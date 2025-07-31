@@ -1,11 +1,12 @@
 <?xml version="1.0"?>
-<package>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
   <name>particle_filter</name>
   <version>0.1.0</version>
-  <description>Particle Filter Localization using RangeLibc for accelerated ray casting.</description>
+  <description>ROS 2 version of Particle Filter Localization using RangeLibc for accelerated ray casting.</description>
 
   <!-- One maintainer tag required, multiple allowed, one person per tag -->
-  <maintainer email="tialim@student.ethz.ch">Tianyi Lim</maintainer>
+  <maintainer email="hariharanr1799@gmail.com">Hariharan Ravichandran</maintainer>
   <author email="tialim@student.ethz.ch">Tianyi Lim</author>
 
   <!-- One license tag required, multiple allowed, one license per tag -->
@@ -13,19 +14,19 @@
 
   <url type="website">https://arxiv.org/abs/2401.07658</url>
 
-  <buildtool_depend>catkin</buildtool_depend>
-  <build_depend>rospy</build_depend>
-  <build_depend>message_runtime</build_depend>
-  <build_depend>sensor_msgs</build_depend>
-  <build_depend>std_msgs</build_depend>
-  <build_depend>map_server</build_depend>
-  <build_depend>dynamic_reconfigure</build_depend>
+  <buildtool_depend>ament_python</buildtool_depend>
+  
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>nav2_map_server</depend>
+  <depend>tf_transformations</depend>
+  
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
 
-  <run_depend>rospy</run_depend>
-  <run_depend>sensor_msgs</run_depend>
-  <run_depend>std_msgs</run_depend>
-  <run_depend>map_server</run_depend>
-  <run_depend>message_runtime</run_depend>
-  <run_depend>dynamic_reconfigure</run_depend>
-
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
 </package>
